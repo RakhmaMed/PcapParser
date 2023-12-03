@@ -3,6 +3,8 @@
 #include <ranges>
 #include <chrono>
 #include <variant>
+#include <algorithm>
+#include <unordered_set>
 
 #include <Packet.h>
 #include <PcapFileDevice.h>
@@ -11,6 +13,8 @@
 #include <coroutine>
 
 #include "Generator.h"
+#include <IPv4Layer.h>
+#include <functional>
 
 void analyzePacket(pcpp::RawPacket& rawPacket, std::ofstream& outputFile)
 {
@@ -76,6 +80,35 @@ Generator<pcpp::Packet> generatePackets(std::string inputPath)
     }
 }
 
+struct ConnInfo {
+    std::string source_ip;
+    std::string dest_ip;
+    uint16_t    source_port;
+    uint16_t    dest_port;
+
+    friend std::ostream& operator<<(std::ostream& oss, const ConnInfo& info) {
+        oss << info.source_ip << ':' << info.source_port << " -> " << info.dest_ip << ':' << info.dest_port;
+        return oss;
+    }
+
+    auto tie() const {
+        return std::tie(source_ip, dest_ip, source_port, dest_port);
+    }
+
+    bool operator==(const ConnInfo& other) const {
+        return tie() == other.tie();
+    }
+};
+
+struct ConnInfoHash {
+    size_t operator()(const ConnInfo& info) const {
+        return std::hash<std::string>()(info.source_ip) ^
+            std::hash<std::string>()(info.dest_ip) ^
+            std::hash<uint16_t>()(info.source_port) ^
+            std::hash<uint16_t>()(info.dest_port);
+    }
+};
+
 int main(int argc, char* argv[])
 {
     std::string inputPath = R"(C:\Users\irahm\Downloads\export.pcapng)";
@@ -88,26 +121,33 @@ int main(int argc, char* argv[])
         std::cerr << "Error opening the output file!" << std::endl;
         return 0;
     }
-    auto start_time = std::chrono::high_resolution_clock::now();
-    auto view = generatePackets(inputPath)
-        | std::views::filter([](const pcpp::Packet& packet) { return packet.isPacketOfType(pcpp::TCP); })
-        | std::views::transform([](const pcpp::Packet& packet) { return packet.getLayerOfType<pcpp::TcpLayer>(); })
-        | std::views::filter([](pcpp::TcpLayer * tcpLayer) {return tcpLayer->getTcpHeader()->portDst == htons(554) || tcpLayer->getTcpHeader()->portSrc == htons(554); })
-        | std::views::transform([](pcpp::TcpLayer *  tcpLayer) {
-                uint8_t* data = tcpLayer->getLayerPayload();
-                size_t dataLen = tcpLayer->getLayerPayloadSize();
 
-                return std::string_view{ reinterpret_cast<const char*>(data), dataLen };
-            });
 
-    std::ranges::copy(view, std::ostream_iterator<std::string_view>(outputFile));
+    std::unordered_set<ConnInfo, ConnInfoHash> connections;
 
-    //analyzePackets(inputPath, outputFile);
+    for (pcpp::Packet packet : generatePackets(inputPath)) {
+        
+        pcpp::IPv4Address srcIP = packet.getLayerOfType<pcpp::IPv4Layer>()->getSrcIPv4Address();
+        pcpp::IPv4Address destIP = packet.getLayerOfType<pcpp::IPv4Layer>()->getDstIPv4Address();
+        pcpp::TcpLayer* tcpLayer = packet.getLayerOfType<pcpp::TcpLayer>();
+        if (!tcpLayer)
+            continue;
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        uint16_t destPort = tcpLayer->getTcpHeader()->portDst;
+        uint16_t sourcePort = tcpLayer->getTcpHeader()->portSrc;
 
-    std::cout << "Time taken: " << duration.count() << " milliseconds" << std::endl;
+        ConnInfo info{
+            .source_ip = srcIP.toString(),
+            .dest_ip = destIP.toString(),
+            .source_port = sourcePort,
+            .dest_port = destPort,
+        };
+        connections.insert(info);
+    }
+
+    for (auto&& connection : connections) {
+        std::cout << connection << '\n';
+    }
 
     return 0;
 }
